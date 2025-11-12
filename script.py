@@ -1,17 +1,18 @@
 import os
 import time
 
-import requests
 from elasticsearch import Elasticsearch, helpers
+from openai import OpenAI
 
 ES_URL = "http://localhost:9200"
-ES_API_KEY = "MDk0NVRwa0IxRGRjVmVKSGl2ZFc6dUFaNkZTUHVXRzEzVjdrejQzSUNxZw=="
+ES_API_KEY = "NDdDQWM1b0JPSDBFTV9JQzA0WVo6eHFXcWFJQmFYNzBwS1RjUllpRUNHZw=="
 INDEX_NAME = "team-data"
-OLLAMA_URL = "http://localhost:11434/api/generate"
+LOCAL_AI_URL = "http://localhost:8080/v1"  # Local AI server URL
 DATASET_FOLDER = "./Dataset"
 
 
 es_client = Elasticsearch(ES_URL, api_key=ES_API_KEY)
+ai_client = OpenAI(base_url=LOCAL_AI_URL, api_key="sk-x")
 
 
 def build_documents(dataset_folder, index_name):
@@ -42,6 +43,7 @@ def index_documents():
         return success, bulk_latency
     except Exception as e:
         print(f"❌ Error: {str(e)}")
+        return 0, 0
 
 
 def semantic_search(query, size=3):
@@ -53,33 +55,36 @@ def semantic_search(query, size=3):
 
     response = es_client.search(index=INDEX_NAME, body=search_body)
     search_latency = (time.time() - start_time) * 1000  # ms
-
+    
     return response["hits"]["hits"], search_latency
 
 
-def query_ollama(prompt, model):
+def query_local_ai(prompt, model):
     start_time = time.time()
-    data = {"model": model, "prompt": prompt, "stream": False, "think": False}
 
-    response = requests.post(OLLAMA_URL, json=data)
+    try:
+        response = ai_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+        )
 
-    ollama_latency = (time.time() - start_time) * 1000  # ms
+        ai_latency = (time.time() - start_time) * 1000  # ms
 
-    if response.status_code == 200:
-        response_data = response.json()
+        # Extract response text
+        response_text = response.choices[0].message.content
 
-        eval_count = response_data.get("eval_count", 0)
-        eval_duration = response_data.get("eval_duration", 0)
+        # Calculate tokens per second if usage info is available
         tokens_per_second = 0
+        if hasattr(response, "usage") and response.usage:
+            total_tokens = response.usage.completion_tokens
+            if ai_latency > 0:
+                tokens_per_second = (total_tokens / ai_latency) * 1000  # tokens/second
 
-        if eval_count > 0 and eval_duration > 0:
-            tokens_per_second = (
-                eval_count / eval_duration * 1_000_000_000
-            )  # nanoseconds to seconds (eval_count / eval_duration * 10^9)
-
-        return response_data["response"], ollama_latency, tokens_per_second
-    else:
-        return f"Error: {response.status_code}", ollama_latency, 0
+        return response_text, ai_latency, tokens_per_second
+    except Exception as e:
+        ai_latency = (time.time() - start_time) * 1000
+        
+        return f"Error: {str(e)}", ai_latency, 0
 
 
 if __name__ == "__main__":
@@ -98,17 +103,18 @@ if __name__ == "__main__":
         source = hit["_source"]
         context += f"File: {source['file_title']}\n"
         context += f"Content: {source['file_content']}\n\n"
-
+        
     prompt = f"{context}\nQuestion: {query}\nAnswer:"
 
-    ollama_model = "smollm2:135m"
-    print(f"🤖 Asking to model: {ollama_model}")
-    response, ollama_latency, tokens_per_second = query_ollama(prompt, ollama_model)
+    ai_model ="dolphin3.0-qwen2.5-0.5b" 
+
+    print(f"🤖 Asking to model: {ai_model}")
+    response, ai_latency, tokens_per_second = query_local_ai(prompt, ai_model)
 
     print(f"\n💡 Question: {query}\n📝 Answer: {response}")
 
     print(f"✅ Indexed {success} documents in {bulk_latency:.0f}ms")
     print(f"🔍 Search Latency: {search_latency:.0f}ms")
     print(
-        f"🤖 Ollama Latency: {ollama_latency:.0f}ms | {tokens_per_second:.1f} tokens/s"
+        f"🤖 AI Latency: {ai_latency:.0f}ms | {tokens_per_second:.1f} tokens/s"
     )
