@@ -1,41 +1,28 @@
 import os
 import time
 
+from dotenv import load_dotenv
 from elasticsearch import Elasticsearch, helpers
 from openai import OpenAI
 
-ES_URL = "http://localhost:9200"
-ES_API_KEY = "NDdDQWM1b0JPSDBFTV9JQzA0WVo6eHFXcWFJQmFYNzBwS1RjUllpRUNHZw=="
-INDEX_NAME = "team-data"
-LOCAL_AI_URL = "http://localhost:8080/v1"  # Local AI server URL
-DATASET_FOLDER = "./Dataset"
+load_dotenv()
+
+ES_URL = os.getenv("ES_URL", "http://localhost:9200")
+ES_API_KEY = os.getenv("ES_API_KEY")
+INDEX_NAME = os.getenv("INDEX_NAME", "team-data")
+LOCAL_AI_URL = os.getenv("LOCAL_AI_URL", "http://localhost:8080/v1")
+DATASET_FOLDER = os.getenv("DATASET_FOLDER", "./Dataset")
 
 
 es_client = Elasticsearch(ES_URL, api_key=ES_API_KEY)
-ai_client = OpenAI(base_url=LOCAL_AI_URL, api_key="sk-x")
+ai_client = OpenAI(
+    base_url=LOCAL_AI_URL, api_key="sk-x"
+)  # You don't need a real OpenAI key for Local AI but we need to pass something, if you leave it blank it throws an error
 
 
 def setup_inference_endpoint():
-    inference_id = "e5-small-model"
-    try:
-        es_client.inference.put(
-            inference_id=inference_id,
-            task_type="text_embedding",
-            body={
-                "service": "elasticsearch",
-                "service_settings": {
-                    "num_allocations": 1,
-                    "num_threads": 1,
-                    "model_id": ".multilingual-e5-small",
-                },
-            },
-        )
-        print(f"✅ Inference endpoint '{inference_id}' created successfully")
-    except Exception as e:
-        print(f"❌ Error creating inference endpoint: {str(e)}")
+    """Create the e5-small-model inference endpoint for text embeddings if it doesn't exist."""
 
-
-def setup_inference_endpoint():
     inference_id = "e5-small-model"
 
     try:
@@ -63,9 +50,12 @@ def setup_inference_endpoint():
 
 
 def setup_index():
+    """Create the Elasticsearch index with semantic_text field mappings if it doesn't exist."""
+
     try:
         if es_client.indices.exists(index=INDEX_NAME):
             print(f"✅ Index '{INDEX_NAME}' already exists")
+            return False
 
         print(f"📦 Creating index '{INDEX_NAME}'...")
         es_client.indices.create(
@@ -84,16 +74,22 @@ def setup_index():
             },
         )
         print(f"✅ Index '{INDEX_NAME}' created successfully")
+        return True
     except Exception as e:
         print(f"❌ Error creating index: {str(e)}")
+        exit(1)
 
 
-def build_documents(dataset_folder, index_name):
+def load_documents(dataset_folder, index_name):
+    """Generator that yields documents from .txt files in the dataset folder for bulk indexing."""
+
     for filename in os.listdir(dataset_folder):
         if filename.endswith(".txt"):
             filepath = os.path.join(dataset_folder, filename)
 
-            with open(filepath, "r", encoding="utf-8") as file:
+            with open(
+                filepath, "r", encoding="utf-8"
+            ) as file:  # UTF-8 encoding ensures proper handling of special characters and international text
                 content = file.read()
 
             yield {
@@ -103,23 +99,25 @@ def build_documents(dataset_folder, index_name):
 
 
 def index_documents():
+    """Bulk index all documents from the dataset folder into Elasticsearch and return success count and latency."""
+
     try:
-        start_time = time.time()
+        if es_client.indices.exists(index=INDEX_NAME) is False:
+            print(f"❌ Error: Index '{INDEX_NAME}' does not exist. ")
+            exit(1)
 
-        success, _ = helpers.bulk(
-            es_client, build_documents(DATASET_FOLDER, INDEX_NAME)
-        )
+        success, _ = helpers.bulk(es_client, load_documents(DATASET_FOLDER, INDEX_NAME))
 
-        end_time = time.time()
-        bulk_latency = (end_time - start_time) * 1000  # ms
-
-        return success, bulk_latency
+        print(f"✅ Indexed {success} documents successfully")
+        return success
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
-        return 0, 0
+        print(f"❌ Error indexing documents: {str(e)}")
+        exit(1)
 
 
 def semantic_search(query, size=3):
+    """Perform semantic search and return top results with latency."""
+
     start_time = time.time()
     search_body = {
         "query": {"semantic": {"field": "semantic_field", "query": query}},
@@ -133,9 +131,12 @@ def semantic_search(query, size=3):
 
 
 def query_local_ai(prompt, model):
+    """Send a prompt to Local AI model and return the response, latency, and tokens per second."""
+
     start_time = time.time()
 
     try:
+        # Using simple completions without streaming.
         response = ai_client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -165,36 +166,51 @@ if __name__ == "__main__":
 
     # Setup inference endpoint and index
     setup_inference_endpoint()
-    setup_index()
+    is_created = setup_index()
 
-    print("\n📥 Indexing documents...")
-    success, bulk_latency = index_documents()
+    if is_created:  # Index was just created, need to index documents
+        print("\n📥 Indexing documents...")
+        success = index_documents()
 
-    time.sleep(2)  # Wait for indexing to complete
+        if success == 0:  # if indexing failed, exit
+            print("❌ Documents indexing failed. Exiting.")
+            exit(1)
+
+        time.sleep(1)  # Wait for indexing to complete
 
     query = "Can you summarize the performance issues in the API?"
 
     print(f"🔍 Search: '{query}'")
     search_results, search_latency = semantic_search(query)
 
-    context = "Information found:\n"
-    for hit in search_results:
+    context = ""
+    citations = []
+    for idx, hit in enumerate(search_results, 1):
         source = hit["_source"]
-        context += f"File: {source['file_title']}\n"
+        context += f"[{idx}] File: {source['file_title']}\n"
         context += f"Content: {source['file_content']}\n\n"
+        citations.append(f"[{idx}] {source['file_title']}")
 
-    prompt = f"{context}\nQuestion: {query}\nAnswer:"
+    prompt = f"""Based on the following documents, answer the user's question. 
+        You MUST cite your sources using the format [1], [2], etc. when referencing information from the documents.
 
+        Documents:
+        {context}
+
+        User Question: {query}
+    """
+
+    ai_model = "dolphin3.0-qwen2.5-0.5b"
+    # ai_model = "smollm2-1.7b-instruct"
     # ai_model = "llama-smoltalk-3.2-1b-instruct"
-    # ai_model = "dolphin3.0-qwen2.5-0.5b"
-    # ai_model = "fastllama-3.2-1b-instruct"
-    ai_model = "smollm2-1.7b-instruct"
 
     print(f"🤖 Asking to model: {ai_model}")
     response, ai_latency, tokens_per_second = query_local_ai(prompt, ai_model)
 
     print(f"\n💡 Question: {query}\n📝 Answer: {response}")
+    print("\n📚 Citations:")
+    for citation in citations:
+        print(f"  {citation}")
 
-    print(f"✅ Indexed {success} documents in {bulk_latency:.0f}ms")
-    print(f"🔍 Search Latency: {search_latency:.0f}ms")
+    print(f"\n🔍 Search Latency: {search_latency:.0f}ms")
     print(f"🤖 AI Latency: {ai_latency:.0f}ms | {tokens_per_second:.1f} tokens/s")
