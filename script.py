@@ -201,8 +201,6 @@ if __name__ == "__main__":
     """
 
     ai_model = "dolphin3.0-qwen2.5-0.5b"
-    # ai_model = "smollm2-1.7b-instruct"
-    # ai_model = "llama-smoltalk-3.2-1b-instruct"
 
     print(f"🤖 Asking to model: {ai_model}")
     response, ai_latency, tokens_per_second = query_local_ai(prompt, ai_model)
